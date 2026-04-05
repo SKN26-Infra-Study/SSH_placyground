@@ -1,0 +1,23 @@
+Port 22
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile /home/jump/.ssh/authorized_keys
+
+# 허용 유저 제한
+AllowUsers jump
+
+# ProxyJump 허용 (TCP 포워딩만, 그 외 전부 차단)
+AllowTcpForwarding yes
+AllowAgentForwarding no
+GatewayPorts no
+X11Forwarding no
+PermitTTY no
+
+# 보안 강화
+MaxAuthTries 3
+LoginGraceTime 30
+
+# 비활성 세션 자동 종료
+ClientAliveInterval 60
+ClientAliveCountMax 3
