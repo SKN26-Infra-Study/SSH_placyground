@@ -1,0 +1,19 @@
+services:
+  jumpserver:
+    build:
+      context: ./jumpserver
+      dockerfile: Dockerfile
+
+    container_name: jumpserver
+    restart: unless-stopped
+    ports:
+      - "2222:22"
+
+    volumes:
+      - ./jumpserver/authorized_keys:/tmp/authorized_keys:ro
+    networks:
+      - jump-net
+
+networks:
+  jump-net:
+    driver: bridge
