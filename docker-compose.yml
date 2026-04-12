@@ -1,16 +1,27 @@
+name: ssh_playground
+
 services:
   jumpserver:
     build:
       context: ./jumpserver
       dockerfile: Dockerfile
-
     container_name: jumpserver
     restart: unless-stopped
     ports:
       - "2222:22"
-
     volumes:
       - ./jumpserver/authorized_keys:/tmp/authorized_keys:ro
+    networks:
+      - jump-net
+
+  jupyter-dummy:
+    build:
+      context: ./jupyter-dummy
+      dockerfile: Dockerfile
+    container_name: jupyter-dummy
+    restart: unless-stopped
+    volumes:
+      - ./jupyter-dummy/authorized_keys:/tmp/authorized_keys:ro
     networks:
       - jump-net
 
