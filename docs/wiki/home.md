@@ -13,6 +13,8 @@
 | [Agent Forwarding vs ProxyJump](#agent-forwarding-vs-proxyjump) | 보안 비교 및 채택 이유 |
 | [파일별 상세 설명](#파일별-상세-설명) | Dockerfile, sshd_config, entrypoint.sh, docker-compose.yml |
 | [키 발급 원리](#키-발급-원리) | 하드웨어 기반 passphrase 생성 방식 |
+| [ngrok 터널 설정](#ngrok-터널-설정) | ngrok TCP 터널 구성 및 자동 접속 |
+| [클라이언트 설정](#클라이언트-설정) | ~/.ssh/config 및 auto_connect.ps1 |
 | [트러블슈팅 기록](#트러블슈팅-기록) | 발생한 오류 및 해결 방법 |
 | [검증 완료 항목](#검증-완료-항목) | 현재까지 검증된 항목 체크리스트 |
 
@@ -23,6 +25,8 @@
 ### ProxyJump 채택
 
 Agent Forwarding은 Jumpserver가 침해될 경우 공격자가 agent 소켓을 통해 RunPod에 무단 접근할 수 있습니다. ProxyJump는 클라이언트가 직접 두 번 핸드셰이크를 처리하므로 Jumpserver에 개인키가 노출되지 않습니다.
+
+> **ForceCommand 방식 폐기 이유**: jumpserver 내부에 `id_ed25519_jump` 개인키를 보관해야 하고, Windows OpenSSH 클라이언트에서 PTY 할당 실패 문제가 발생합니다. ProxyJump 방식으로 전환하여 jumpserver에 private key를 완전히 제거했습니다.
 
 ### Alpine 3.23 선택
 
@@ -46,34 +50,47 @@ FastAPI / Chainlit 컨테이너에는 SSH 키가 존재하지 않습니다.
 | 위치 | 보관 키 |
 |---|---|
 | 개발자 PC | 본인 `id_ed25519_A` 개인키만 |
-| Jumpserver | `authorized_keys` (팀원 공개키) + `id_ed25519_jump` |
+| Jumpserver | `authorized_keys` (팀원 공개키)만 — private key 없음 |
 | FastAPI / Chainlit | SSH 키 없음 — API Key만 |
-| RunPod | `id_ed25519_jump` 공개키만 |
+| RunPod | `id_ed25519_A` 공개키만 (ProxyJump 직접 인증) |
 
 ---
 
 ## SSH 접속 흐름
 
-![SSH 접속 흐름](https://raw.githubusercontent.com/SKN26-Infra-Study/SSH_placyground/main/docs/image/ssh_flow.png)
+```
+개발자 PC
+  └─(id_ed25519_A)─→ ngrok TCP 터널
+                         └─→ jumpserver:2222 (relay only)
+                                  └─(ProxyJump)─→ jupyter-dummy:2222
+                                                       └─ Jupyter Server:8888
+                                                            ↑
+                                     SSH -L 8888:127.0.0.1:8888
+```
 
 ---
 
 ## Agent Forwarding vs ProxyJump
 
-![Agent Forwarding vs ProxyJump](https://raw.githubusercontent.com/SKN26-Infra-Study/SSH_placyground/main/docs/image/af_vs_proxyjump.png)
-
 ```
 # sshd_config 핵심 설정
-AllowAgentForwarding no   # Agent Forwarding 명시적 차단
-AllowTcpForwarding yes    # ProxyJump에 필요한 포트 포워딩만 허용
-PermitTTY no              # 쉘 접근 차단
+AllowAgentForwarding no      # Agent Forwarding 명시적 차단
+AllowTcpForwarding local     # ProxyJump에 필요한 포트 포워딩만 허용
+PermitTTY no                 # 쉘 접근 차단
 ```
+
+| 항목 | Agent Forwarding | ProxyJump |
+|---|---|---|
+| Jumpserver private key | 불필요 | 불필요 |
+| Jumpserver 침해 시 | agent 소켓 탈취 위험 | 영향 없음 |
+| Windows 호환성 | 제한적 | ✅ |
+| 구조 복잡도 | 낮음 | 낮음 |
 
 ---
 
 ## 파일별 상세 설명
 
-### Dockerfile
+### jumpserver/Dockerfile
 
 ```dockerfile
 FROM alpine:3.23
@@ -81,19 +98,19 @@ FROM alpine:3.23
 RUN apk add --no-cache openssh bash
 
 # jump 전용 유저 생성 + 패스워드 잠금 해제
-# adduser -D 로 생성한 계정은 기본 잠금 상태 → passwd -u 로 해제 필요
 RUN adduser -D -s /bin/bash jump && \
     passwd -u jump
 
 COPY sshd_config /etc/ssh/sshd_config
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r//' /entrypoint.sh && \
+    chmod +x /entrypoint.sh
 
 EXPOSE 22
 ENTRYPOINT ["/entrypoint.sh"]
 ```
 
-### sshd_config
+### jumpserver/sshd_config
 
 ```
 Port 22
@@ -102,43 +119,37 @@ PasswordAuthentication no
 PubkeyAuthentication yes
 AuthorizedKeysFile /home/jump/.ssh/authorized_keys
 AllowUsers jump
-AllowTcpForwarding yes
+AllowTcpForwarding local
 AllowAgentForwarding no
 GatewayPorts no
 X11Forwarding no
 PermitTTY no
-StrictModes no
+PermitUserRC no
 MaxAuthTries 3
 LoginGraceTime 30
 ClientAliveInterval 60
 ClientAliveCountMax 3
 ```
 
-> `StrictModes no`: `/tmp`에서 복사한 `authorized_keys`의 소유권 체크를 우회합니다.
-
-### entrypoint.sh
+### jumpserver/entrypoint.sh
 
 ```bash
 #!/bin/bash
 set -e
 
-# 1. SSH 호스트 키 생성 (최초 1회만)
 if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
     ssh-keygen -A
     echo "[jumpserver] host key create"
 fi
 
-# 2. jump 유저 .ssh 디렉토리 설정
 mkdir -p /home/jump/.ssh
 chmod 700 /home/jump/.ssh
 
-# 3. /tmp/authorized_keys 마운트 확인
 if [ ! -f /tmp/authorized_keys ]; then
     echo "[jumpserver] Error: authorized_keys not found"
     exit 1
 fi
 
-# 4. 복사 후 권한 설정
 cp /tmp/authorized_keys /home/jump/.ssh/authorized_keys
 chmod 600 /home/jump/.ssh/authorized_keys
 chown -R jump:jump /home/jump/.ssh
@@ -147,11 +158,94 @@ echo "[jumpserver] 시작 완료 — sshd 실행 중"
 exec /usr/sbin/sshd -D -e
 ```
 
-> `authorized_keys`를 `/tmp`에 마운트하는 이유: `:ro` 마운트된 경로에서는 `chmod` / `chown`이 불가하므로 `/tmp`에 마운트 후 복사합니다.
+### jumpserver/authorized_keys 등록 형식
+
+```
+restrict,port-forwarding,permitopen="jupyter-dummy:2222" ssh-ed25519 AAAA... WIN_PC이름_식별자
+```
+
+### jupyter-dummy/Dockerfile
+
+```dockerfile
+FROM alpine:3.23
+
+RUN apk add --no-cache openssh bash python3 py3-pip
+
+RUN adduser -D -s /bin/bash user && \
+    passwd -u user
+
+RUN pip3 install --no-cache-dir --break-system-packages \
+    notebook \
+    ipykernel
+
+COPY sshd_config /etc/ssh/sshd_config
+COPY entrypoint.sh /entrypoint.sh
+RUN sed -i 's/\r//' /entrypoint.sh && \
+    chmod +x /entrypoint.sh
+
+EXPOSE 2222
+ENTRYPOINT ["/entrypoint.sh"]
+```
+
+### jupyter-dummy/sshd_config
+
+```
+Port 2222
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile /home/user/.ssh/authorized_keys
+AllowUsers user
+AllowTcpForwarding yes
+X11Forwarding no
+PermitTTY yes
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 60
+ClientAliveCountMax 3
+```
+
+### jupyter-dummy/entrypoint.sh
+
+```bash
+#!/bin/bash
+set -e
+
+if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
+    ssh-keygen -A
+    echo "[jupyter-dummy] host key created"
+fi
+
+mkdir -p /home/user/.ssh
+chmod 700 /home/user/.ssh
+
+if [ ! -f /tmp/authorized_keys ]; then
+    echo "[jupyter-dummy] Error: authorized_keys not found"
+    exit 1
+fi
+
+cp /tmp/authorized_keys /home/user/.ssh/authorized_keys
+chmod 600 /home/user/.ssh/authorized_keys
+chown -R user:user /home/user/.ssh
+
+# Jupyter Notebook 백그라운드 실행 (127.0.0.1 바인딩)
+su - user -c "jupyter notebook \
+    --ip=127.0.0.1 \
+    --port=8888 \
+    --no-browser \
+    --NotebookApp.token='' \
+    --NotebookApp.password='' \
+    &"
+
+echo "[jupyter-dummy] 시작 완료 — sshd 실행 중"
+exec /usr/sbin/sshd -D -e
+```
 
 ### docker-compose.yml
 
 ```yaml
+name: ssh_playground
+
 services:
   jumpserver:
     build:
@@ -165,6 +259,31 @@ services:
       - ./jumpserver/authorized_keys:/tmp/authorized_keys:ro
     networks:
       - jump-net
+
+  jupyter-dummy:
+    build:
+      context: ./jupyter-dummy
+      dockerfile: Dockerfile
+    container_name: jupyter-dummy
+    restart: unless-stopped
+    volumes:
+      - ./jupyter-dummy/authorized_keys:/tmp/authorized_keys:ro
+    networks:
+      - jump-net
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: ngrok
+    restart: unless-stopped
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+    command: tcp jumpserver:22
+    ports:
+      - "4040:4040"
+    networks:
+      - jump-net
+    depends_on:
+      - jumpserver
 
 networks:
   jump-net:
@@ -206,10 +325,81 @@ $PASSPHRASE = ([BitConverter]::ToString($HashBytes) -replace '-', '').Substring(
 Write-Host "Passphrase: $PASSPHRASE"
 ```
 
-### authorized_keys 등록 형식
+---
+
+## ngrok 터널 설정
+
+### ngrok.yml (프로젝트 루트)
+
+```yaml
+version: "2"
+
+tunnels:
+  jumpserver:
+    proto: tcp
+    addr: 2222
+```
+
+### 터널 실행
+
+```powershell
+# 프로젝트별 config 병합 실행
+ngrok start jumpserver --config $env:USERPROFILE\AppData\Local\ngrok\ngrok.yml --config .\ngrok.yml
+```
+
+### 터널 주소 확인
+
+```powershell
+Invoke-RestMethod http://localhost:4040/api/tunnels
+```
+
+---
+
+## 클라이언트 설정
+
+### ~/.ssh/config
 
 ```
-restrict,port-forwarding ssh-ed25519 AAAA... WIN_DESKTOP-이름_식별자
+Host jump
+    HostName <ngrok-host>
+    Port <ngrok-port>
+    User jump
+    IdentityFile ~/.ssh/id_ed25519_A
+    IdentitiesOnly yes
+
+Host jupyter-dummy
+    HostName jupyter-dummy
+    Port 2222
+    User user
+    ProxyJump jump
+    IdentityFile ~/.ssh/id_ed25519_A
+    IdentitiesOnly yes
+```
+
+### auto_connect.ps1 사용법
+
+```powershell
+# ngrok 자동 감지
+.\auto_connect.ps1
+
+# 수동 입력
+.\auto_connect.ps1 -NgrokHost 0.tcp.jp.ngrok.io -NgrokPort 15951
+
+# Jupyter 터널 없이
+.\auto_connect.ps1 -NoJupyter
+
+# Jupyter 포트 변경
+.\auto_connect.ps1 -LocalPort 9999
+```
+
+### Jupyter LocalForward
+
+```powershell
+# 백그라운드 실행
+ssh -fN -L 8888:127.0.0.1:8888 jupyter-dummy
+
+# 브라우저 접속
+# http://localhost:8888
 ```
 
 ---
@@ -277,6 +467,42 @@ ssh-keygen -R "[localhost]:2222"
 
 ---
 
+### entrypoint.sh: no such file or directory
+
+**증상**
+```
+exec /entrypoint.sh: no such file or directory
+```
+**원인** Windows에서 파일 저장 시 CRLF 줄바꿈 → Alpine에서 인식 불가  
+**해결** Dockerfile에 CRLF → LF 변환 추가
+```dockerfile
+RUN sed -i 's/\r//' /entrypoint.sh
+```
+
+---
+
+### PTY allocation request failed (ForceCommand 방식)
+
+**증상**
+```
+PTY allocation request failed on channel 0
+```
+**원인** Windows OpenSSH 클라이언트에서 ForceCommand 환경의 PTY 할당 제한  
+**해결** ForceCommand 방식 폐기 → ProxyJump 방식으로 전환
+
+---
+
+### Load key: error in libcrypto
+
+**증상**
+```
+Load key "/home/jump/.ssh/id_ed25519_jump": error in libcrypto
+```
+**원인** Windows에서 개인키 파일 저장 시 인코딩 손상  
+**해결** ForceCommand 방식 폐기 → ProxyJump 방식으로 전환 (jumpserver에 private key 불필요)
+
+---
+
 ## 검증 완료 항목
 
 | 항목 | 상태 | 날짜 |
@@ -286,6 +512,9 @@ ssh-keygen -R "[localhost]:2222"
 | 하드웨어 기반 ED25519 키 인증 | ✅ | 2026-04-05 |
 | PermitTTY no (쉘 차단) | ✅ | 2026-04-05 |
 | 공개키 인증 로그 확인 | ✅ | 2026-04-05 |
-| 터널 서비스 외부 접속 | ⬜ | - |
-| Jupyter ProxyJump + LocalForward | ⬜ | - |
+| ForceCommand → ProxyJump 전환 | ✅ | 2026-04-12 |
+| ngrok TCP 터널 외부 접속 | ✅ | 2026-04-12 |
+| jupyter-dummy ProxyJump + LocalForward | ✅ | 2026-04-12 |
+| 브라우저 Jupyter 접속 확인 | ✅ | 2026-04-12 |
+| auto_connect.ps1 자동화 | ⬜ | - |
 | RunPod 실제 연동 | ⬜ | - |
