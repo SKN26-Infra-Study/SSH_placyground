@@ -1,0 +1,16 @@
+Port 2222
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile /home/user/.ssh/authorized_keys
+
+AllowUsers user
+
+AllowTcpForwarding yes
+X11Forwarding no
+PermitTTY yes
+
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 60
+ClientAliveCountMax 3
